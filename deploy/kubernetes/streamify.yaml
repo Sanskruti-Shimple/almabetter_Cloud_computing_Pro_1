@@ -1,0 +1,429 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: streamify
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: streamify-api
+  namespace: streamify
+  annotations:
+    azure.workload.identity/client-id: 5e894536-9b4b-464e-9137-b38b80a27e3f
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: streamify-worker
+  namespace: streamify
+  annotations:
+    azure.workload.identity/client-id: d04b2716-72b0-45df-9707-a3167450c6f1
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: streamify-config
+  namespace: streamify
+data:
+  APP_ENV: production
+  SERVICE_ROLE: api
+  KAFKA_TOPIC: azehmrwgomixitryy6
+  KAFKA_DLQ_TOPIC: azehdrwgomixitryy6
+  KAFKA_GROUP_ID: music-event-processors
+  KAFKA_BOOTSTRAP_SERVERS: azehrwgomixitryy6.servicebus.windows.net:9093
+  EVENTHUB_NAMESPACE: azehrwgomixitryy6
+  AZURE_STORAGE_ACCOUNT_URL: https://azstrwgomixitryy6.blob.core.windows.net
+  AZURE_STORAGE_CONTAINER: azctrwgomixitryy6
+---
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: streamify-keyvault
+  namespace: streamify
+spec:
+  provider: azure
+  secretObjects:
+    - secretName: streamify-secrets
+      type: Opaque
+      data:
+        - objectName: api-read-token
+          key: api-read-token
+        - objectName: api-write-token
+          key: api-write-token
+        - objectName: pii-hmac-key
+          key: pii-hmac-key
+        - objectName: redis-password
+          key: redis-password
+        - objectName: redis-url
+          key: redis-url
+  parameters:
+    usePodIdentity: "false"
+    useVMManagedIdentity: "true"
+    userAssignedIdentityID: 85f299c2-9771-4740-a690-b796e1be5b0d
+    keyvaultName: azkvrwgomixitryy6
+    tenantId: edd2c3c2-008e-4b70-9f98-baf1e7aad491
+    objects: |
+      array:
+        - |
+          objectName: api-read-token
+          objectType: secret
+        - |
+          objectName: api-write-token
+          objectType: secret
+        - |
+          objectName: pii-hmac-key
+          objectType: secret
+        - |
+          objectName: redis-password
+          objectType: secret
+        - |
+          objectName: redis-url
+          objectType: secret
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: streamify-api
+  namespace: streamify
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: streamify-api
+  template:
+    metadata:
+      labels:
+        app: streamify-api
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: streamify-api
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: azacrrwgomixitryy6.azurecr.io/streamify-api:1.0.1
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: streamify-config
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: azehrwgomixitryy6.servicebus.windows.net:9093
+            - name: KAFKA_SECURITY_PROTOCOL
+              value: SASL_SSL
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: streamify-secrets
+                  key: redis-url
+            - name: API_READ_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: streamify-secrets
+                  key: api-read-token
+            - name: API_WRITE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: streamify-secrets
+                  key: api-write-token
+            - name: PII_HMAC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: streamify-secrets
+                  key: pii-hmac-key
+          volumeMounts:
+            - name: secrets-store-inline
+              mountPath: /mnt/secrets-store
+              readOnly: true
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 768Mi
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            failureThreshold: 20
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: secrets-store-inline
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: streamify-keyvault
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: streamify-api
+  namespace: streamify
+spec:
+  type: LoadBalancer
+  selector:
+    app: streamify-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: streamify-worker
+  namespace: streamify
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: streamify-worker
+  template:
+    metadata:
+      labels:
+        app: streamify-worker
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: streamify-worker
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: worker
+          image: azacrrwgomixitryy6.azurecr.io/streamify-worker:1.0.1
+          envFrom:
+            - configMapRef:
+                name: streamify-config
+          env:
+            - name: SERVICE_ROLE
+              value: worker
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: streamify-secrets
+                  key: redis-url
+            - name: PII_HMAC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: streamify-secrets
+                  key: pii-hmac-key
+            - name: KAFKA_SECURITY_PROTOCOL
+              value: SASL_SSL
+            - name: EVENTHUB_NAMESPACE
+              valueFrom:
+                configMapKeyRef:
+                  name: streamify-config
+                  key: EVENTHUB_NAMESPACE
+          volumeMounts:
+            - name: secrets-store-inline
+              mountPath: /mnt/secrets-store
+              readOnly: true
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: secrets-store-inline
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: streamify-keyvault
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: streamify-redis
+  namespace: streamify
+spec:
+  type: ClusterIP
+  selector:
+    app: streamify-redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: streamify-redis
+  namespace: streamify
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: streamify-redis
+  template:
+    metadata:
+      labels:
+        app: streamify-redis
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        fsGroupChangePolicy: Always
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          command:
+            - sh
+            - -c
+            - exec redis-server --appendonly yes --requirepass "$REDIS_PASSWORD"
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: streamify-secrets
+                  key: redis-password
+          ports:
+            - name: redis
+              containerPort: 6379
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: redis-data
+              mountPath: /data
+            - name: redis-tmp
+              mountPath: /tmp
+      volumes:
+        - name: redis-data
+          emptyDir: {}
+        - name: redis-tmp
+          emptyDir: {}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-ingress
+  namespace: streamify
+spec:
+  podSelector:
+    matchLabels:
+      app: streamify-redis
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: streamify-api
+        - podSelector:
+            matchLabels:
+              app: streamify-worker
+      ports:
+        - protocol: TCP
+          port: 6379
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: streamify-api
+  namespace: streamify
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: streamify-api
+  minReplicas: 3
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: streamify-api
+  namespace: streamify
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: streamify-api
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: streamify-worker
+  namespace: streamify
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: streamify-worker
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: streamify-worker
+  namespace: streamify
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: streamify-worker
+  minReplicas: 3
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65
